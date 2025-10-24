@@ -1,0 +1,4 @@
+psutil
+Pillow
+luma.core
+luma.oled
