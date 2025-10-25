@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
-import os, time, socket, shutil
+import os, time, socket, shutil, re
 from datetime import datetime
+from subprocess import run
 
 import psutil
 from PIL import ImageFont, Image, ImageDraw
@@ -68,6 +69,39 @@ def disk_line():
     du = shutil.disk_usage("/")
     used = du.total - du.free
     return f"Disk: {bytes2human(used)}/{bytes2human(du.total)} {int(100*used/du.total)}%"
+
+def power_line():
+    """Get power consumption from Pi 5 PMIC"""
+    try:
+        # Use vcgencmd to read PMIC data (same as your pi5_voltage.py)
+        result = run(["vcgencmd", "pmic_read_adc"], capture_output=True, text=True)
+        if result.returncode != 0:
+            return "Power: N/A"
+        
+        # Parse the output for voltage and current
+        lines = result.stdout.splitlines()
+        voltage = None
+        current = None
+        
+        for line in lines:
+            # Look for USB voltage and current readings
+            # Format: USB_V volt(2)=5.123 or USB_I current(3)=1.234
+            match = re.search(r'USB_V volt\(\d+\)=([0-9.]+)', line)
+            if match:
+                voltage = float(match.group(1))
+            
+            match = re.search(r'USB_I current\(\d+\)=([0-9.]+)', line)
+            if match:
+                current = float(match.group(1))
+        
+        if voltage and current:
+            power = voltage * current
+            return f"Power: {power:.1f}W"
+        else:
+            return "Power: N/A"
+    
+    except Exception:
+        return "Power: N/A"
 
 # ---------- Display ----------
 def make_device():
@@ -152,7 +186,7 @@ def main():
     font_top = load_font(FONT_SIZE_TOP)
     font_bottom = load_font(FONT_SIZE_BOTTOM)
 
-    stats = [up_line, ip_line, load_line, mem_line, disk_line]
+    stats = [up_line, ip_line, load_line, mem_line, disk_line, power_line]
     idx = 0
     last_rotate = time.monotonic()
 
