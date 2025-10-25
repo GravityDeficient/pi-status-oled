@@ -4,10 +4,11 @@ A standalone Raspberry Pi OLED status display that shows real-time system inform
 
 ## Features
 
-- **Real-time system monitoring**: CPU, memory, disk usage, uptime, and network info
+- **Real-time system monitoring**: CPU percentage with throttling detection, memory, disk usage, temperature, uptime, and network info
+- **Throttling alerts**: Shows CPU thermal throttling and under-voltage warnings
 - **Smart scrolling**: Long text scrolls smoothly with preserved positioning
 - **Auto-restart**: Service automatically restarts on failure
-- **Low resource usage**: Minimal CPU and memory footprint
+- **Optimized performance**: Efficient caching system for minimal CPU overhead
 - **Easy installation**: One-script setup with systemd service integration
 
 ## Files
@@ -89,15 +90,26 @@ The OLED cycles through these system stats every 10 seconds:
 - **Bottom line** (rotates):
   - Uptime
   - IP address
-  - CPU load average
+  - CPU percentage with throttling indicators (THROT, UV)
   - Memory usage
   - Disk usage
+  - CPU temperature with detailed throttling history
+
+### Status Indicators
+
+- **CPU: 15.2%** - Normal CPU usage
+- **CPU: 12.5% THROT** - CPU is thermally throttled
+- **CPU: 8.1% UV** - Under-voltage detected
+- **Temp: 67.8°C THROT** - Currently throttled due to temperature
+- **Temp: 55.1°C TH-H** - Throttling has occurred (history)
 
 ## Features
 
 - **Smart scrolling**: Long text scrolls smoothly, preserves position when numbers update
+- **Throttling monitoring**: Real-time detection of CPU thermal throttling and under-voltage
+- **Efficient caching**: System calls are cached to minimize CPU overhead
 - **Auto-restart**: Service restarts on failure
-- **Low resource usage**: Minimal CPU and memory footprint
+- **Optimized performance**: 10 FPS display updates with 2-second data caching
 - **Clean shutdown**: Graceful exit on system shutdown
 
 ## Troubleshooting
@@ -148,7 +160,8 @@ Edit `status-oled.py` to customize:
 
 - `ROTATE_SECONDS`: How long each stat is displayed (default: 10)
 - `SCROLL_SPEED_PX`: Scroll speed in pixels per frame (default: 4)
-- `SCROLL_TICK_S`: Frame rate for scrolling (default: 0.05 = 20fps)
+- `SCROLL_TICK_S`: Frame rate for scrolling (default: 0.1 = 10fps)
+- `CACHE_SECONDS`: How long to cache expensive system calls (default: 2)
 - `FONT_SIZE_TOP/BOTTOM`: Font sizes (default: 16)
 
 After changes, restart the service:
