@@ -20,11 +20,69 @@ FONT_SIZE_TOP = 16       # hostname line
 FONT_SIZE_BOTTOM = 16    # stats line
 ROTATE_SECONDS = 10      # how long before switching to next stat
 SCROLL_SPEED_PX = 4      # pixels per frame when scrolling
-SCROLL_TICK_S = 0.05     # ~20 FPS
+SCROLL_TICK_S = 0.1      # 10 FPS (reduced from 20 FPS)
 SCROLL_GAP_PX = 24       # gap between repeated copies
+CACHE_SECONDS = 2        # cache expensive operations for 2 seconds
 # ----------------------------
 
+# Global cache for expensive operations
+_cache = {
+    'vcgencmd_data': {'time': 0, 'throttled': '0x0', 'temp': 'N/A', 'power_data': ''},
+    'cpu_percent': {'time': 0, 'value': 0.0},
+    'ip_addr': {'time': 0, 'value': '0.0.0.0'}
+}
+
 # ---------- Helpers ----------
+def get_cached_vcgencmd_data():
+    """Cache expensive vcgencmd calls"""
+    now = time.monotonic()
+    cache = _cache['vcgencmd_data']
+    
+    if now - cache['time'] > CACHE_SECONDS:
+        try:
+            # Get all vcgencmd data in one batch
+            throttled_result = run(["vcgencmd", "get_throttled"], capture_output=True, text=True)
+            temp_result = run(["vcgencmd", "measure_temp"], capture_output=True, text=True)
+            power_result = run(["vcgencmd", "pmic_read_adc"], capture_output=True, text=True)
+            
+            cache['throttled'] = throttled_result.stdout.strip() if throttled_result.returncode == 0 else "throttled=0x0"
+            cache['temp'] = temp_result.stdout.strip() if temp_result.returncode == 0 else "temp=0.0'C"
+            cache['power_data'] = power_result.stdout if power_result.returncode == 0 else ""
+            cache['time'] = now
+        except Exception:
+            pass
+    
+    return cache
+
+def get_cached_cpu_percent():
+    """Cache CPU percentage with less frequent updates"""
+    now = time.monotonic()
+    cache = _cache['cpu_percent']
+    
+    if now - cache['time'] > CACHE_SECONDS:
+        try:
+            cache['value'] = psutil.cpu_percent(interval=0.1)  # Reduced from 1.0 second
+            cache['time'] = now
+        except Exception:
+            pass
+    
+    return cache['value']
+
+def get_cached_ip():
+    """Cache IP address lookup"""
+    now = time.monotonic()
+    cache = _cache['ip_addr']
+    
+    if now - cache['time'] > 10:  # Cache IP for 10 seconds
+        try:
+            ip = os.popen("hostname -I").read().strip().split()[0]
+            cache['value'] = ip
+            cache['time'] = now
+        except Exception:
+            pass
+    
+    return cache['value']
+
 def load_font(size):
     for p in FONT_PATHS:
         try:
@@ -50,15 +108,34 @@ def host_line():
     return socket.gethostname()
 
 def ip_line():
-    try:
-        ip = os.popen("hostname -I").read().strip().split()[0]
-    except Exception:
-        ip = "0.0.0.0"
+    ip = get_cached_ip()
     return f"IP:{ip}"
 
 def load_line():
-    l1, _, _ = os.getloadavg()
-    return f"CPU: {l1:.2f}"
+    # Get cached CPU percentage and throttling status
+    cpu_percent = get_cached_cpu_percent()
+    
+    # Get cached throttling data
+    vcgencmd_data = get_cached_vcgencmd_data()
+    
+    try:
+        throttled_hex = vcgencmd_data['throttled'].split('=')[1]
+        throttled_val = int(throttled_hex, 16)
+        
+        # Parse throttling bits
+        currently_throttled = throttled_val & 0x2  # Bit 1: Currently throttled
+        temp_limit = throttled_val & 0x1           # Bit 0: Under-voltage detected
+        
+        # Create status indicator
+        status = ""
+        if currently_throttled:
+            status += " THROT"  # Thermal throttling
+        if temp_limit:
+            status += " UV"     # Under-voltage
+            
+        return f"CPU: {cpu_percent:.1f}%{status}"
+    except Exception:
+        return f"CPU: {cpu_percent:.1f}%"
 
 def mem_line():
     vm = psutil.virtual_memory()
@@ -71,37 +148,97 @@ def disk_line():
     return f"Disk: {bytes2human(used)}/{bytes2human(du.total)} {int(100*used/du.total)}%"
 
 def power_line():
-    """Get power consumption from Pi 5 PMIC"""
+    """Get power consumption from Pi 5 PMIC (USB-C or PoE)"""
+    vcgencmd_data = get_cached_vcgencmd_data()
+    
     try:
-        # Use vcgencmd to read PMIC data (same as your pi5_voltage.py)
-        result = run(["vcgencmd", "pmic_read_adc"], capture_output=True, text=True)
-        if result.returncode != 0:
+        # Use cached PMIC data
+        lines = vcgencmd_data['power_data'].splitlines()
+        if not lines:
             return "Power: N/A"
         
-        # Parse the output for voltage and current
-        lines = result.stdout.splitlines()
-        voltage = None
-        current = None
+        # Collect all voltage readings
+        voltages = {}
+        currents = {}
         
         for line in lines:
-            # Look for USB voltage and current readings
-            # Format: USB_V volt(2)=5.123 or USB_I current(3)=1.234
-            match = re.search(r'USB_V volt\(\d+\)=([0-9.]+)', line)
-            if match:
-                voltage = float(match.group(1))
+            # Voltage readings
+            v_match = re.search(r'(\w+)_V volt\(\d+\)=([0-9.]+)', line)
+            if v_match:
+                rail_name = v_match.group(1)
+                voltage = float(v_match.group(2))
+                voltages[rail_name] = voltage
             
-            match = re.search(r'USB_I current\(\d+\)=([0-9.]+)', line)
-            if match:
-                current = float(match.group(1))
+            # Current readings  
+            i_match = re.search(r'(\w+)_I current\(\d+\)=([0-9.]+)', line)
+            if i_match:
+                rail_name = i_match.group(1)
+                current = float(i_match.group(2))
+                currents[rail_name] = current
         
-        if voltage and current:
-            power = voltage * current
-            return f"Power: {power:.1f}W"
+        # Calculate power for matching voltage/current pairs
+        total_power = 0
+        power_found = False
+        
+        for rail in voltages:
+            if rail in currents and voltages[rail] > 0 and currents[rail] > 0:
+                power = voltages[rail] * currents[rail]
+                total_power += power
+                power_found = True
+        
+        if power_found:
+            source_indicator = ""
+            if "USB" in voltages:
+                source_indicator = " (USB)"
+            elif any("5V" in rail for rail in voltages):
+                source_indicator = " (PoE)"
+            
+            return f"Power: {total_power:.1f}W{source_indicator}"
         else:
             return "Power: N/A"
     
     except Exception:
         return "Power: N/A"
+
+def temp_line():
+    """Get CPU temperature and detailed throttling info"""
+    vcgencmd_data = get_cached_vcgencmd_data()
+    
+    try:
+        # Parse cached temperature
+        temp = "N/A"
+        temp_match = re.search(r'temp=([0-9.]+)', vcgencmd_data['temp'])
+        if temp_match:
+            temp = f"{float(temp_match.group(1)):.1f}°C"
+        
+        # Parse cached throttling data
+        throttle_info = ""
+        throttled_hex = vcgencmd_data['throttled'].split('=')[1]
+        throttled_val = int(throttled_hex, 16)
+        
+        # Check various throttling conditions
+        if throttled_val & 0x1:    # Under-voltage detected
+            throttle_info += "UV "
+        if throttled_val & 0x2:    # Currently throttled
+            throttle_info += "THROT "
+        if throttled_val & 0x4:    # Currently capped
+            throttle_info += "CAP "
+        if throttled_val & 0x8:    # Currently soft temperature limit
+            throttle_info += "SOFT "
+            
+        # Historical flags (bits 16-19)
+        if throttled_val & 0x10000:  # Under-voltage has occurred
+            throttle_info += "UV-H "
+        if throttled_val & 0x20000:  # Throttling has occurred  
+            throttle_info += "TH-H "
+        
+        if throttle_info:
+            return f"Temp: {temp} {throttle_info.strip()}"
+        else:
+            return f"Temp: {temp}"
+            
+    except Exception:
+        return "Temp: N/A"
 
 # ---------- Display ----------
 def make_device():
@@ -186,7 +323,7 @@ def main():
     font_top = load_font(FONT_SIZE_TOP)
     font_bottom = load_font(FONT_SIZE_BOTTOM)
 
-    stats = [up_line, ip_line, load_line, mem_line, disk_line, power_line]
+    stats = [up_line, ip_line, load_line, mem_line, disk_line, power_line, temp_line]
     idx = 0
     last_rotate = time.monotonic()
 
