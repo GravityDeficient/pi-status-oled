@@ -27,7 +27,7 @@ CACHE_SECONDS = 2        # cache expensive operations for 2 seconds
 
 # Global cache for expensive operations
 _cache = {
-    'vcgencmd_data': {'time': 0, 'throttled': '0x0', 'temp': 'N/A', 'power_data': ''},
+    'vcgencmd_data': {'time': 0, 'throttled': '0x0', 'temp': 'N/A'},
     'cpu_percent': {'time': 0, 'value': 0.0},
     'ip_addr': {'time': 0, 'value': '0.0.0.0'}
 }
@@ -40,14 +40,12 @@ def get_cached_vcgencmd_data():
     
     if now - cache['time'] > CACHE_SECONDS:
         try:
-            # Get all vcgencmd data in one batch
+            # Get throttling and temperature data
             throttled_result = run(["vcgencmd", "get_throttled"], capture_output=True, text=True)
             temp_result = run(["vcgencmd", "measure_temp"], capture_output=True, text=True)
-            power_result = run(["vcgencmd", "pmic_read_adc"], capture_output=True, text=True)
             
             cache['throttled'] = throttled_result.stdout.strip() if throttled_result.returncode == 0 else "throttled=0x0"
             cache['temp'] = temp_result.stdout.strip() if temp_result.returncode == 0 else "temp=0.0'C"
-            cache['power_data'] = power_result.stdout if power_result.returncode == 0 else ""
             cache['time'] = now
         except Exception:
             pass
@@ -59,12 +57,13 @@ def get_cached_cpu_percent():
     now = time.monotonic()
     cache = _cache['cpu_percent']
     
-    if now - cache['time'] > CACHE_SECONDS:
+    if now - cache['time'] > 1:  # Update every 1 second instead of 2
         try:
-            cache['value'] = psutil.cpu_percent(interval=0.1)  # Reduced from 1.0 second
+            # Use psutil.cpu_percent() without interval for non-blocking call
+            cache['value'] = psutil.cpu_percent()
             cache['time'] = now
         except Exception:
-            pass
+            cache['value'] = 0.0
     
     return cache['value']
 
@@ -146,59 +145,6 @@ def disk_line():
     du = shutil.disk_usage("/")
     used = du.total - du.free
     return f"Disk: {bytes2human(used)}/{bytes2human(du.total)} {int(100*used/du.total)}%"
-
-def power_line():
-    """Get power consumption from Pi 5 PMIC (USB-C or PoE)"""
-    vcgencmd_data = get_cached_vcgencmd_data()
-    
-    try:
-        # Use cached PMIC data
-        lines = vcgencmd_data['power_data'].splitlines()
-        if not lines:
-            return "Power: N/A"
-        
-        # Collect all voltage readings
-        voltages = {}
-        currents = {}
-        
-        for line in lines:
-            # Voltage readings
-            v_match = re.search(r'(\w+)_V volt\(\d+\)=([0-9.]+)', line)
-            if v_match:
-                rail_name = v_match.group(1)
-                voltage = float(v_match.group(2))
-                voltages[rail_name] = voltage
-            
-            # Current readings  
-            i_match = re.search(r'(\w+)_I current\(\d+\)=([0-9.]+)', line)
-            if i_match:
-                rail_name = i_match.group(1)
-                current = float(i_match.group(2))
-                currents[rail_name] = current
-        
-        # Calculate power for matching voltage/current pairs
-        total_power = 0
-        power_found = False
-        
-        for rail in voltages:
-            if rail in currents and voltages[rail] > 0 and currents[rail] > 0:
-                power = voltages[rail] * currents[rail]
-                total_power += power
-                power_found = True
-        
-        if power_found:
-            source_indicator = ""
-            if "USB" in voltages:
-                source_indicator = " (USB)"
-            elif any("5V" in rail for rail in voltages):
-                source_indicator = " (PoE)"
-            
-            return f"Power: {total_power:.1f}W{source_indicator}"
-        else:
-            return "Power: N/A"
-    
-    except Exception:
-        return "Power: N/A"
 
 def temp_line():
     """Get CPU temperature and detailed throttling info"""
@@ -323,7 +269,10 @@ def main():
     font_top = load_font(FONT_SIZE_TOP)
     font_bottom = load_font(FONT_SIZE_BOTTOM)
 
-    stats = [up_line, ip_line, load_line, mem_line, disk_line, power_line, temp_line]
+    # Initialize CPU monitoring (first call always returns 0.0)
+    psutil.cpu_percent()
+
+    stats = [up_line, ip_line, load_line, mem_line, disk_line, temp_line]
     idx = 0
     last_rotate = time.monotonic()
 
