@@ -1,6 +1,6 @@
 # Pi Status OLED Monitor
 
-A Raspberry Pi OLED status display that shows real-time system information on a 128x32 SSD1306 I²C OLED display.
+A standalone Raspberry Pi OLED status display that shows real-time system information on a 128x32 SSD1306 I²C OLED display.
 
 ## Features
 
