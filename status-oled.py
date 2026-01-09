@@ -23,6 +23,11 @@ SCROLL_SPEED_PX = 4      # pixels per frame when scrolling
 SCROLL_TICK_S = 0.1      # 10 FPS (reduced from 20 FPS)
 SCROLL_GAP_PX = 24       # gap between repeated copies
 CACHE_SECONDS = 2        # cache expensive operations for 2 seconds
+
+# Anti burn-in: shift static content position periodically
+BURNIN_SHIFT_SECONDS = 30   # shift position every N seconds
+BURNIN_SHIFT_MAX_X = 2      # max horizontal shift in pixels
+BURNIN_SHIFT_MAX_Y = 1      # max vertical shift in pixels
 # ----------------------------
 
 # Global cache for expensive operations
@@ -186,6 +191,54 @@ def temp_line():
     except Exception:
         return "Temp: N/A"
 
+# ---------- Anti Burn-in ----------
+class BurnInShifter:
+    """
+    Cycles through pixel offset positions to prevent OLED burn-in.
+    Creates a pattern that ensures all pixels get rest time.
+    """
+    def __init__(self, max_x, max_y, shift_seconds):
+        self.max_x = max_x
+        self.max_y = max_y
+        self.shift_seconds = shift_seconds
+        self.last_shift = time.monotonic()
+        # Generate all offset positions in a pattern
+        # Pattern: cycle through corners and center to distribute wear
+        self._positions = self._generate_positions()
+        self._pos_idx = 0
+        self.offset_x = 0
+        self.offset_y = 0
+
+    def _generate_positions(self):
+        """Generate offset positions that cycle through different areas"""
+        positions = [(0, 0)]  # center/default
+        # Add horizontal shifts
+        for x in range(1, self.max_x + 1):
+            positions.append((x, 0))
+            positions.append((-x, 0))
+        # Add vertical shifts
+        for y in range(1, self.max_y + 1):
+            positions.append((0, y))
+            positions.append((0, -y))
+        # Add diagonal combinations
+        for x in range(1, self.max_x + 1):
+            for y in range(1, self.max_y + 1):
+                positions.append((x, y))
+                positions.append((-x, y))
+                positions.append((x, -y))
+                positions.append((-x, -y))
+        return positions
+
+    def update(self):
+        """Check if it's time to shift and update offset"""
+        now = time.monotonic()
+        if now - self.last_shift >= self.shift_seconds:
+            self._pos_idx = (self._pos_idx + 1) % len(self._positions)
+            self.offset_x, self.offset_y = self._positions[self._pos_idx]
+            self.last_shift = now
+            return True
+        return False
+
 # ---------- Display ----------
 def make_device():
     serial = i2c(port=I2C_PORT, address=I2C_ADDR)
@@ -247,21 +300,25 @@ def ensure_state_for_text(state, text, font, screen_w):
                     ratio = state["w"] / old_w
                     state["x"] = int(state["x"] * ratio)
 
-def draw_marquee_line(draw, y, state, screen_w, gap_px, speed_px):
+def draw_marquee_line(draw, y, state, screen_w, gap_px, speed_px, offset_x=0, offset_y=0):
+    """
+    Draw a marquee line with optional pixel offset for burn-in protection.
+    offset_x/offset_y shift the entire line to distribute pixel wear.
+    """
+    y_adj = y + offset_y
     if not state["scroll"]:
-        draw.bitmap((0, y), state["img"], fill=1)
+        draw.bitmap((offset_x, y_adj), state["img"], fill=1)
         return
-    x = state["x"]
-    draw.bitmap((x, y), state["img"], fill=1)
+    x = state["x"] + offset_x
+    draw.bitmap((x, y_adj), state["img"], fill=1)
     x2 = x + state["w"] + gap_px
     if x2 < screen_w:
-        draw.bitmap((x2, y), state["img"], fill=1)
+        draw.bitmap((x2, y_adj), state["img"], fill=1)
     # advance & wrap
-    x -= speed_px
+    state["x"] -= speed_px
     total = state["w"] + gap_px
-    if x < -total:
-        x += total
-    state["x"] = x
+    if state["x"] < -total:
+        state["x"] += total
 
 # ---------- Main ----------
 def main():
@@ -279,8 +336,18 @@ def main():
     top_state = init_state()
     bottom_state = init_state()
 
+    # Anti burn-in: shift static content periodically
+    burnin_shifter = BurnInShifter(
+        BURNIN_SHIFT_MAX_X,
+        BURNIN_SHIFT_MAX_Y,
+        BURNIN_SHIFT_SECONDS
+    )
+
     while True:
         now = time.monotonic()
+
+        # Update burn-in protection offset
+        burnin_shifter.update()
 
         line1 = host_line()
         line2 = stats[idx % len(stats)]()
@@ -289,7 +356,14 @@ def main():
         ensure_state_for_text(bottom_state, line2, font_bottom, device.width)
 
         with canvas(device) as draw:
-            draw_marquee_line(draw, 0,  top_state, device.width, SCROLL_GAP_PX, SCROLL_SPEED_PX)
+            # Top line uses burn-in offset (static content protection)
+            draw_marquee_line(
+                draw, 0, top_state, device.width,
+                SCROLL_GAP_PX, SCROLL_SPEED_PX,
+                offset_x=burnin_shifter.offset_x,
+                offset_y=burnin_shifter.offset_y
+            )
+            # Bottom line scrolls naturally, so less burn-in concern
             draw_marquee_line(draw, 16, bottom_state, device.width, SCROLL_GAP_PX, SCROLL_SPEED_PX)
 
         if (now - last_rotate) >= ROTATE_SECONDS:
