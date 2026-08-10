@@ -106,6 +106,8 @@ The OLED cycles through these system stats every 10 seconds:
 ## Features
 
 - **Smart scrolling**: Long text scrolls smoothly, preserves position when numbers update
+- **Burn-in mitigation**: Text too short to scroll (hostname, uptime) ping-pongs across the
+  leftover width, on top of the ±3px sweep, so no pixel stays lit indefinitely
 - **Throttling monitoring**: Real-time detection of CPU thermal throttling and under-voltage
 - **Efficient caching**: System calls are cached to minimize CPU overhead
 - **Auto-restart**: Service restarts on failure
@@ -163,6 +165,9 @@ Edit `status-oled.py` to customize:
 - `SCROLL_TICK_S`: Frame rate for scrolling (default: 0.1 = 10fps)
 - `CACHE_SECONDS`: How long to cache expensive system calls (default: 2)
 - `FONT_SIZE_TOP/BOTTOM`: Font sizes (default: 16)
+- `BOUNCE_SPEED_PX`: Ping-pong travel per frame for text that fits (default: 1)
+- `BOUNCE_PAUSE_S`: Dwell at each end of the ping-pong (default: 1.5)
+- `BURNIN_SHIFT_SECONDS` / `BURNIN_SHIFT_MAX_X`: Whole-frame sweep rate and range
 
 After changes, restart the service:
 ```bash

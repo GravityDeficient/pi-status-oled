@@ -27,6 +27,11 @@ CACHE_SECONDS = 2        # cache expensive operations for 2 seconds
 # Anti burn-in: horizontal sweep to distribute pixel wear
 BURNIN_SHIFT_SECONDS = 30   # shift position every N seconds
 BURNIN_SHIFT_MAX_X = 3      # max horizontal shift in pixels (sweeps left/right)
+# Anti burn-in: text that fits on screen ping-pongs across the leftover width.
+# The sweep above is only +/-3px; a short line like a hostname otherwise sits on
+# the same ~77px of pixels forever, which is what actually burns in.
+BOUNCE_SPEED_PX = 1         # ping-pong travel per frame
+BOUNCE_PAUSE_S = 1.5        # dwell at each end of the ping-pong
 # ----------------------------
 
 # Global cache for expensive operations
@@ -239,7 +244,20 @@ def make_device():
 
 # --- marquee helpers ---
 def init_state():
-    return {"text": None, "img": None, "w": 0, "x": 0, "scroll": False, "text_template": None}
+    return {"text": None, "img": None, "w": 0, "x": 0, "scroll": False,
+            "text_template": None, "dir": 1, "pause": 0}
+
+def font_ink_box(font):
+    """Top padding and ink height for a font, measured off a fixed sample.
+
+    Using a constant sample ("Ay") rather than the text itself keeps every line
+    on the same baseline regardless of whether it happens to have descenders.
+    """
+    try:
+        box = font.getbbox("Ay")
+        return box[1], max(box[3] - box[1], 1)
+    except Exception:
+        return 0, 12
 
 def render_text_image(text, font):
     # Render to exact-width 1-bit image so we can scroll precisely
@@ -247,13 +265,12 @@ def render_text_image(text, font):
     d = ImageDraw.Draw(tmp)
     w = int(d.textlength(text, font=font))
     w = max(w, 1)
-    # height from font metrics; fallback to 12
-    try:
-        h = font.getbbox("Ay")[3]
-    except Exception:
-        h = 12
+    # Trim the font's top padding so glyphs sit flush at y=0. At size 16 that
+    # padding is 3px, which on a 32px panel was pushing the bottom line's
+    # descenders off the display.
+    pad_top, h = font_ink_box(font)
     img = Image.new("1", (w, h), 0)
-    ImageDraw.Draw(img).text((0, 0), text, font=font, fill=1)
+    ImageDraw.Draw(img).text((0, -pad_top), text, font=font, fill=1)
     return img
 
 def get_text_template(text):
@@ -274,29 +291,37 @@ def should_preserve_scroll_position(old_text, new_text):
 def ensure_state_for_text(state, text, font, screen_w):
     if text != state["text"]:
         old_text = state["text"]
+        old_scroll = state["scroll"]
         preserve_scroll = should_preserve_scroll_position(old_text, text)
-        
+
         state["text"] = text
         state["img"] = render_text_image(text, font)
         old_w = state["w"]
         state["w"] = state["img"].width
         state["scroll"] = state["w"] > screen_w
-        
-        if not preserve_scroll or not state["scroll"]:
-            # Reset scroll position for new text structure or non-scrolling text
+
+        if not preserve_scroll or state["scroll"] != old_scroll:
+            # New text structure, or it just crossed the overflow threshold:
+            # scrolling text enters from the right, bouncing text starts at 0.
             state["x"] = screen_w if state["scroll"] else 0
-        else:
+            state["dir"] = 1
+            state["pause"] = 0
+        elif state["scroll"]:
             # Preserve scroll position but adjust for width changes
             if old_w != state["w"]:
                 # Adjust position proportionally if width changed
                 if old_w > 0:
                     ratio = state["w"] / old_w
                     state["x"] = int(state["x"] * ratio)
+        else:
+            # Bouncing: keep position and direction so a ticking counter doesn't
+            # reset the sweep, but stay inside the new slack.
+            state["x"] = max(0, min(state["x"], max(screen_w - state["w"], 0)))
 
 def draw_marquee_line(draw, y, state, screen_w, gap_px, speed_px, offset_x=0):
     """Draw a marquee line with optional horizontal offset for burn-in protection."""
     if not state["scroll"]:
-        draw.bitmap((offset_x, y), state["img"], fill=1)
+        draw_bounce_line(draw, y, state, screen_w, offset_x)
         return
     x = state["x"] + offset_x
     draw.bitmap((x, y), state["img"], fill=1)
@@ -308,6 +333,35 @@ def draw_marquee_line(draw, y, state, screen_w, gap_px, speed_px, offset_x=0):
     total = state["w"] + gap_px
     if state["x"] < -total:
         state["x"] += total
+
+def draw_bounce_line(draw, y, state, screen_w, offset_x=0):
+    """Ping-pong text that fits on screen, so no pixel stays lit indefinitely."""
+    slack = screen_w - state["w"]
+    if slack <= 0:
+        # Exactly full width; the sweep offset is all the relief this line gets.
+        draw.bitmap((offset_x, y), state["img"], fill=1)
+        return
+
+    x = max(0, min(state["x"], slack))
+    # Sweep offset rides on top of the bounce, clamped so the text never
+    # clips off either edge.
+    draw.bitmap((max(0, min(x + offset_x, slack)), y), state["img"], fill=1)
+
+    if state["pause"] > 0:
+        state["pause"] -= 1
+        state["x"] = x
+        return
+
+    x += state["dir"] * BOUNCE_SPEED_PX
+    if x >= slack:
+        x = slack
+        state["dir"] = -1
+        state["pause"] = int(BOUNCE_PAUSE_S / SCROLL_TICK_S)
+    elif x <= 0:
+        x = 0
+        state["dir"] = 1
+        state["pause"] = int(BOUNCE_PAUSE_S / SCROLL_TICK_S)
+    state["x"] = x
 
 # ---------- Main ----------
 def main():
@@ -347,8 +401,14 @@ def main():
                 SCROLL_GAP_PX, SCROLL_SPEED_PX,
                 offset_x=burnin_shifter.offset_x
             )
-            # Bottom line scrolls naturally, no burn-in concern
-            draw_marquee_line(draw, 16, bottom_state, device.width, SCROLL_GAP_PX, SCROLL_SPEED_PX)
+            # Bottom line scrolls when it overflows, but the short stats
+            # (uptime, CPU) sit still for their whole 10s slot, so they get
+            # the same treatment.
+            draw_marquee_line(
+                draw, 16, bottom_state, device.width,
+                SCROLL_GAP_PX, SCROLL_SPEED_PX,
+                offset_x=burnin_shifter.offset_x
+            )
 
         if (now - last_rotate) >= ROTATE_SECONDS:
             idx += 1
